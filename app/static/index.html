@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Transcrição de Áudio</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>Transcrição de Áudio</h1>
+  </header>
+
+  <main class="container">
+    <div class="actions">
+      <button id="btn-upload" class="btn-primary">+ Transcrever arquivo</button>
+      <input type="file" id="input-file" accept=".mp3,audio/mpeg" hidden />
+    </div>
+
+    <p id="upload-erro" class="erro-msg" hidden></p>
+
+    <table class="lista-transcricoes">
+      <thead>
+        <tr>
+          <th>Arquivo</th>
+          <th>Enviado em</th>
+          <th>Tamanho</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody id="lista-corpo">
+        <tr id="lista-vazia">
+          <td colspan="4" class="vazio">Nenhuma transcrição ainda.</td>
+        </tr>
+      </tbody>
+    </table>
+  </main>
+
+  <div id="modal" class="modal" hidden>
+    <div class="modal-conteudo">
+      <div class="modal-cabecalho">
+        <h2 id="modal-titulo">Transcrição</h2>
+        <button id="modal-fechar" class="btn-fechar" aria-label="Fechar">&times;</button>
+      </div>
+      <pre id="modal-texto" class="modal-texto"></pre>
+      <div class="modal-rodape">
+        <button id="btn-copiar" class="btn-primary">Copiar texto</button>
+        <span id="copiado-msg" class="copiado-msg" hidden>Copiado!</span>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/script.js"></script>
+</body>
+</html>
