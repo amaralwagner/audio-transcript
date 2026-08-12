@@ -1,8 +1,11 @@
 import os
+import shutil
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
 import httpx
+import imageio_ffmpeg
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -25,6 +28,9 @@ AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 MAX_SIZE_MB = 25
 MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024
 
+# O gpt-4o-transcribe rejeita áudios com mais de 1500s; cortamos com folga.
+CHUNK_SECONDS = 1200
+
 database.init_db()
 
 app = FastAPI(title="Transcrição de Áudio")
@@ -35,30 +41,66 @@ def verificar_token(x_access_token: str = Header(default=None)):
         raise HTTPException(status_code=401, detail="Token de acesso inválido")
 
 
+def dividir_audio(caminho_arquivo: Path, pasta_saida: Path) -> list[Path]:
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    padrao_saida = pasta_saida / "parte_%03d.mp3"
+    comando = [
+        ffmpeg_exe,
+        "-y",
+        "-loglevel", "error",
+        "-i", str(caminho_arquivo),
+        "-vn",
+        "-map", "0:a:0",
+        "-f", "segment",
+        "-segment_time", str(CHUNK_SECONDS),
+        "-c", "copy",
+        "-reset_timestamps", "1",
+        str(padrao_saida),
+    ]
+    subprocess.run(comando, check=True, capture_output=True)
+    return sorted(pasta_saida.glob("parte_*.mp3"))
+
+
+def transcrever_chunk(caminho_chunk: Path) -> str:
+    url = (
+        f"{AZURE_OPENAI_ENDPOINT}/openai/deployments/{AZURE_OPENAI_DEPLOYMENT}"
+        f"/audio/transcriptions?api-version=2025-03-01-preview"
+    )
+    with open(caminho_chunk, "rb") as f:
+        files = {"file": (caminho_chunk.name, f, "audio/mpeg")}
+        data = {"language": "pt"}
+        headers = {"api-key": AZURE_OPENAI_API_KEY}
+        resposta = httpx.post(url, headers=headers, files=files, data=data, timeout=300)
+
+    if resposta.status_code != 200:
+        raise RuntimeError(f"Erro do Azure ({resposta.status_code}): {resposta.text}")
+
+    return resposta.json().get("text", "")
+
+
 def transcrever_arquivo(id: int, caminho_arquivo: Path) -> None:
+    pasta_partes = caminho_arquivo.parent / f"{id}_partes"
     try:
         if not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_API_KEY or not AZURE_OPENAI_DEPLOYMENT:
             raise RuntimeError("Configuração do Azure OpenAI ausente no servidor")
 
-        url = (
-            f"{AZURE_OPENAI_ENDPOINT}/openai/deployments/{AZURE_OPENAI_DEPLOYMENT}"
-            f"/audio/transcriptions?api-version=2025-03-01-preview"
-        )
-        with open(caminho_arquivo, "rb") as f:
-            files = {"file": (caminho_arquivo.name, f, "audio/mpeg")}
-            data = {"language": "pt"}
-            headers = {"api-key": AZURE_OPENAI_API_KEY}
-            resposta = httpx.post(url, headers=headers, files=files, data=data, timeout=300)
+        pasta_partes.mkdir(exist_ok=True)
+        partes = dividir_audio(caminho_arquivo, pasta_partes)
+        if not partes:
+            raise RuntimeError("Não foi possível dividir o áudio para transcrição")
 
-        if resposta.status_code != 200:
-            raise RuntimeError(f"Erro do Azure ({resposta.status_code}): {resposta.text}")
+        textos = [transcrever_chunk(parte) for parte in partes]
+        texto = " ".join(t.strip() for t in textos if t.strip())
 
-        texto = resposta.json().get("text", "")
         database.concluir_transcricao(id, texto)
+    except subprocess.CalledProcessError as exc:
+        erro_ffmpeg = exc.stderr.decode(errors="replace") if exc.stderr else str(exc)
+        database.marcar_erro(id, f"Falha ao processar o áudio (ffmpeg): {erro_ffmpeg}")
     except Exception as exc:
         database.marcar_erro(id, str(exc))
     finally:
         caminho_arquivo.unlink(missing_ok=True)
+        shutil.rmtree(pasta_partes, ignore_errors=True)
 
 
 @app.post("/transcrever", dependencies=[Depends(verificar_token)])
