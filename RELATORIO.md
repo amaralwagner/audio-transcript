@@ -35,11 +35,11 @@ Todos exigem o header `x-access-token` (exceto os arquivos estáticos e a págin
 - **Recebe:** `multipart/form-data` com campo `file` (arquivo `.mp3`)
 - **Validações no backend:**
   - extensão do arquivo deve terminar em `.mp3` (senão `400`)
-  - tamanho do arquivo (após leitura) não pode passar de 25MB (senão `400`)
+  - tamanho do arquivo (após leitura) não pode passar de 200MB (senão `400`) — ver [seção 11](#11-divisão-automática-de-áudios-grandes-por-tamanho-2026-08-13) para o porquê desse valor
 - **Comportamento:**
   1. cria imediatamente um registro no banco com status `processando`
   2. salva o arquivo em `app/uploads/{id}_{nome_original}.mp3`
-  3. dispara a transcrição em segundo plano (`BackgroundTasks` do FastAPI)
+  3. dispara a transcrição em segundo plano (`BackgroundTasks` do FastAPI) — se o arquivo passar de 25MB (limite do Whisper), ele é dividido automaticamente em pedaços antes de ser enviado para a API (seção 11)
 - **Retorna:** `{"id": <int>}` — id do registro criado, com status `202`-like (na prática `200`), imediatamente, sem esperar a transcrição terminar
 
 ### `GET /transcricoes`
@@ -69,7 +69,10 @@ Banco: `app/transcricao.db`, criado automaticamente em `database.init_db()` na i
 | `tamanho_mb` | `REAL NOT NULL` | tamanho do arquivo em MB, arredondado a 2 casas decimais |
 | `status` | `TEXT NOT NULL` | restrito por `CHECK` a `'processando'`, `'concluido'` ou `'erro'` |
 | `texto_transcrito` | `TEXT` (nullable) | preenchido quando `status = 'concluido'` |
-| `mensagem_erro` | `TEXT` (nullable) | preenchido quando `status = 'erro'` |
+| `mensagem_erro` | `TEXT` (nullable) | preenchido quando `status = 'erro'`; para falha num pedaço de um áudio dividido, indica qual (ex: `"Falha ao transcrever parte 2 de 3: ..."`) |
+| `progresso` | `TEXT` (nullable) | adicionada em 2026-08-13; preenchida durante o processamento de áudios divididos em pedaços (ex: `"Processando parte 2 de 3"`), limpa (`NULL`) ao concluir ou errar — ver [seção 11](#11-divisão-automática-de-áudios-grandes-por-tamanho-2026-08-13) |
+
+A coluna `progresso` é adicionada via `ALTER TABLE ... ADD COLUMN` em `database.init_db()` (dentro de um `try/except sqlite3.OperationalError`), então bancos `transcricao.db` criados antes dessa mudança são migrados automaticamente na próxima inicialização do app, sem precisar apagar o arquivo.
 
 Não há outras tabelas. O acesso é feito via `sqlite3` puro (sem ORM), com uma conexão nova por operação (`get_connection()`), usando `row_factory = sqlite3.Row` para permitir conversão direta para dicionário.
 
@@ -127,6 +130,9 @@ Se `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY` ou `AZURE_OPENAI_DEPLOYMENT` 
 | `python-multipart` | 0.0.9 | Necessário para o FastAPI processar uploads `multipart/form-data` (`UploadFile`) |
 | `httpx` | 0.27.2 | Cliente HTTP usado para chamar a API de transcrição do Azure OpenAI |
 | `python-dotenv` | 1.0.1 | Carrega as variáveis do arquivo `.env` para o ambiente do processo |
+| `imageio-ffmpeg` | 0.5.1 | Empacota um binário estático do `ffmpeg` multiplataforma — usado pelo `pydub` para decodificar/codificar áudio sem depender de um `ffmpeg` instalado no sistema |
+| `pydub` | 0.25.1 | Manipulação de áudio (carregar, cortar por tempo, reexportar) usada para dividir arquivos grandes em pedaços antes de enviar ao Whisper — ver [seção 11](#11-divisão-automática-de-áudios-grandes-por-tamanho-2026-08-13) |
+| `audioop-lts` | 0.2.1 (só em Python ≥ 3.13) | O `pydub` depende do módulo `audioop`, removido da biblioteca padrão a partir do Python 3.13; este pacote o reimplementa. Marcado como condicional (`; python_version >= "3.13"`) no `requirements.txt` — não instala em Python 3.11 (o runtime usado no Azure App Service), onde `audioop` ainda é nativo; só é necessário para rodar localmente em máquinas com Python 3.13+ |
 
 `sqlite3` não está listado por ser parte da biblioteca padrão do Python.
 
@@ -188,7 +194,8 @@ Sem um recurso Azure OpenAI real configurado, o app sobe e a listagem/upload fun
 - **SQLite local em arquivo único** — sem servidor de banco separado; não é adequado para múltiplos usuários simultâneos ou alta concorrência de escrita, mas é suficiente para uso pessoal.
 - **Processamento em `BackgroundTask` do FastAPI, não fila/worker dedicado** — mais simples de operar (sem infraestrutura extra), mas o processamento ainda roda no mesmo processo do servidor web; uma transcrição longa consome recursos do processo que também atende requisições HTTP.
 - **Atualização por polling (3s), não WebSocket** — mais simples de implementar e depurar, mas gera requisições HTTP repetidas mesmo sem mudança de estado, e a UI pode levar até ~3s para refletir uma conclusão.
-- **Limite fixo de 25MB** — corresponde ao limite do serviço Whisper no Azure OpenAI; arquivos maiores precisariam de compressão/chunking, que não foi implementado.
+- **Limite de upload de 200MB, com divisão automática acima de 25MB** — o limite de 25MB é do serviço Whisper no Azure OpenAI, não do app; arquivos entre 25MB e 200MB são divididos automaticamente em pedaços antes da transcrição (seção 11). 200MB é um teto arbitrário só para evitar upload/processamento de arquivos absurdamente grandes, não um limite técnico do Whisper.
+- **Divisão de áudio decodifica o arquivo inteiro em memória (`pydub`)** — para um áudio de ~1h em mp3, a versão decodificada (PCM) em RAM fica na casa de várias centenas de MB. Isso não foi testado sob as restrições reais de memória do plano F1 do Azure App Service (documentadas como ~1GB); se o processo estourar memória em produção, a mitigação seria trocar a decodificação completa via `pydub` por um corte via `ffmpeg` usando apenas os timestamps (sem carregar o PCM inteiro na RAM).
 - **Token único e simples (`ACCESS_TOKEN`)** — não há múltiplos usuários, papéis, expiração ou rotação de token; adequado para uso pessoal, não para múltiplos usuários com necessidades de acesso diferentes.
 - **Arquivos `.mp3` descartados após a transcrição** — o áudio original não fica disponível para reprocessamento; se a transcrição falhar, é preciso reenviar o arquivo.
 - **Sem paginação na listagem** — `GET /transcricoes` sempre retorna o histórico inteiro; para um histórico muito grande isso pode ficar lento.
@@ -204,7 +211,63 @@ Sem um recurso Azure OpenAI real configurado, o app sobe e a listagem/upload fun
 - **Deploy no Azure App Service** — não foi executado; o comando `az webapp up` e a configuração de app settings/startup command não foram validados na prática.
 - **Comportamento no plano F1 sob carga real** — limites de CPU/memória do F1, cold start, e persistência de arquivo em reinícios não foram observados.
 - **Uso do app pelo navegador (UI manual)** — os testes realizados foram via `curl` (backend); a interface (`index.html`/`script.js`) ainda não foi verificada visualmente num navegador em uso normal (fluxo do `prompt()` de token, o modal, o botão de copiar, ícones de status). Um bug de CSS já identificado por captura de tela do usuário (modal aparecendo aberto por padrão) foi corrigido em `style.css` (`.modal[hidden] { display: none; }`), mas o restante da UI segue sem verificação visual.
-- **Arquivo maior que 25MB** — a validação de tamanho (frontend e backend) não foi exercitada com um arquivo real acima do limite.
+- ~~Arquivo maior que 25MB~~ — **validado em 2026-08-13**, ver [seção 11](#11-divisão-automática-de-áudios-grandes-por-tamanho-2026-08-13).
 - **Extensão inválida (não `.mp3`)** — a rejeição de arquivos com outra extensão não foi testada via requisição real.
 - **Renovação/expiração do token inválido em uso** — o comportamento do frontend ao receber `401` no meio do uso (token trocado ou expirado) não foi testado interativamente.
 - **Concorrência** — múltiplos uploads simultâneos ou uploads durante o polling não foram testados.
+
+---
+
+## 11. Divisão automática de áudios grandes por tamanho (2026-08-13)
+
+### Motivação
+
+Em teste real com uma reunião de ~1h, dois problemas apareceram:
+
+1. **Arquivos acima de 25MB eram rejeitados no upload** (`MAX_SIZE_BYTES`), mesmo sendo esse um limite do serviço Whisper, não do app — não havia como transcrever um áudio de reunião longo.
+2. **Uma transcrição enviada por inteiro voltou incompleta** (faltou parte do texto) — mesma causa raiz: o arquivo estava perto/acima do limite de tamanho processado de uma vez pela API.
+
+### O que mudou
+
+- **Upload:** o limite passou de 25MB (rejeitava o arquivo) para **200MB** (`MAX_UPLOAD_MB` em `app/main.py`) — um teto arbitrário só contra abuso, bem acima do necessário.
+- **Transcrição — dois caminhos**, decididos pelo tamanho do arquivo já salvo em disco (`WHISPER_LIMIT_BYTES` = 25MB):
+  - **≤ 25MB:** comportamento inalterado — o arquivo original é enviado direto para o Whisper numa única chamada.
+  - **> 25MB:** o arquivo é dividido em pedaços antes da transcrição (`dividir_audio_por_tamanho()` em `app/main.py`):
+    1. o **número de pedaços** é calculado a partir do **tamanho do arquivo**: `num_partes = ceil(tamanho_bytes / CHUNK_TARGET_BYTES)`, com `CHUNK_TARGET_MB = 20` (ex: 60MB → 3 pedaços de ~20MB).
+    2. a **duração total** do áudio (via `pydub`/`ffmpeg`) é dividida em `num_partes` intervalos de tempo iguais — o corte acontece em amostras decodificadas (não em bytes arbitrários do arquivo comprimido), então nunca corte no meio de um frame de áudio.
+    3. cada pedaço é reexportado como `.mp3` numa **taxa de bits fixa** (`CHUNK_EXPORT_BITRATE = "128k"`), o que torna o tamanho de saída de cada pedaço previsível e independente da taxa de bits do arquivo original (o cálculo do passo 1 assume implicitamente uma taxa de bits ~constante; reexportar numa taxa fixa é o que garante essa suposição na prática).
+    4. cada pedaço é enviado ao Whisper **em sequência** (não em paralelo); o texto de cada resposta é acumulado numa lista e concatenado com espaço (`" ".join(...)`) ao final, na ordem original — evita palavras coladas no ponto de corte.
+    5. o registro no banco só é atualizado (`status = 'concluido'`, `texto_transcrito`) **depois que todos os pedaços forem transcritos com sucesso**. Se um pedaço falhar, a exceção é reformulada como `"Falha ao transcrever parte {N} de {total}: {erro original}"` e o registro inteiro vai para `status = 'erro'` com essa mensagem — nada é salvo parcialmente.
+    6. em qualquer caso (sucesso ou erro), o arquivo original e a pasta de pedaços temporários (`uploads/{id}_partes/`) são apagados no `finally` — sem lixo acumulando no disco do plano F1.
+- **Progresso visível:** nova coluna `progresso` na tabela `transcricoes` (migração automática via `ALTER TABLE`), atualizada a cada pedaço (`"Processando parte 2 de 3"`) e limpa ao concluir/errar. O frontend (`script.js`) mostra esse texto como uma segunda linha, menor e cinza, abaixo do spinner "Processando" — só aparece quando o áudio está sendo dividido; para arquivos que não precisam de divisão, o status continua como antes.
+- **Frontend:** `MAX_SIZE_MB` em `script.js` atualizado de 25 para 200 (a mensagem de validação já é gerada a partir dessa constante, então passou a dizer "200MB" automaticamente, sem string hardcoded para trocar).
+
+### Armadilha encontrada durante o teste: `pydub` precisa de `ffprobe`, não só de `ffmpeg`
+
+O `pydub.AudioSegment.from_file()` sempre chama `ffprobe` internamente para inspecionar o arquivo antes de decodificar — mas o pacote `imageio-ffmpeg` (usado para não depender de um `ffmpeg` do sistema) só empacota o binário do `ffmpeg`, não o `ffprobe`. Isso quebrava com `[WinError 2] O sistema não pode encontrar o arquivo especificado` assim que um áudio grande chegava para ser dividido.
+
+**Correção:** passar `format="mp3", codec="mp3"` para `AudioSegment.from_file()`. Quando um `codec` é informado explicitamente, o `pydub` pula a chamada ao `ffprobe` (ele só a usa para *auto-detectar* o codec de entrada) — como o app já garante que todo upload é `.mp3` (validado na extensão), forçar o codec é seguro e elimina a dependência de `ffprobe`.
+
+### ffmpeg no ambiente de deploy (Azure App Service Linux)
+
+Não é necessário instalar `ffmpeg` via `apt`/`packages` no App Service: o app usa o binário estático empacotado pelo `imageio-ffmpeg` (`imageio_ffmpeg.get_ffmpeg_exe()`), independente do que estiver (ou não) instalado no sistema operacional do container. Isso já era verdade antes desta mudança (decisão tomada no commit anterior, que introduziu `imageio-ffmpeg`) e continua valendo aqui. Caso um dia se opte por usar um `ffmpeg` do sistema em vez do empacotado, seria necessário adicionar um arquivo `aptPackages.txt`/`packages.txt` com `ffmpeg` na raiz do deploy (mecanismo do Oryx/App Service Linux para instalar pacotes apt) — mas isso não foi feito nem é necessário com a abordagem atual.
+
+### Teste de ponta a ponta realizado
+
+Como não havia à mão uma gravação real de reunião acima de 25MB, foi gerado um áudio sintético para o teste:
+- dois trechos curtos de fala (SAPI do Windows) — um "de abertura" e um "de encerramento", com frases distintas para dá pra checar visualmente se a ordem das partes bate;
+- preenchido no meio com um tom senoidal gerado via `ffmpeg` (`sine=frequency=440`) até o arquivo final somar **29,26MB** a 128kbps (~32 min de áudio).
+
+Resultado, contra o recurso Azure real (`wdo-mkhacjbb-eastus2`, deployment `gpt-4o-transcribe`):
+- o arquivo foi dividido automaticamente em **2 pedaços** (29,26MB / 20MB → `ceil = 2`), como esperado;
+- a coluna `progresso` mostrou corretamente `"Processando parte 1 de 2"` e depois `"Processando parte 2 de 2"` durante o processamento (poll via `GET /transcricoes/{id}`);
+- status final `concluido`, com o texto dos dois pedaços concatenado **na ordem correta** — a frase de encerramento (só presente no 2º pedaço) apareceu depois da frase de abertura (só presente no 1º), sem sobreposição nem repetição;
+- o arquivo original e a pasta `uploads/{id}_partes/` foram apagados ao final — confirmado via listagem do diretório após a conclusão;
+- também foi testado (mesmo teste, arquivo pequeno de 0,12MB) que o **caminho sem divisão continua funcionando** sem diferenças;
+- também foi simulada uma **falha no 2º de 2 pedaços** (chamada à API monkeypatchada para lançar erro): o registro foi corretamente marcado como `status = 'erro'` com `mensagem_erro = "Falha ao transcrever parte 2 de 2: Erro simulado do Azure (429)"`, e os arquivos temporários também foram limpos nesse caso.
+
+**Observação sobre qualidade da transcrição no teste:** o texto do primeiro pedaço (fala + ~14min de tom senoidal) saiu parcialmente incompreensível/alucinado pelo modelo — comportamento conhecido de modelos da família Whisper quando processam longos trechos de áudio sem fala real (não é um problema da lógica de divisão/concatenação, que preservou corretamente a ordem e a integridade dos dois pedaços). Numa gravação real de reunião, com fala contínua, esse efeito não é esperado.
+
+### Limitação conhecida não testada
+
+A decodificação do áudio inteiro em memória pelo `pydub` antes da divisão (ver seção 9) não foi testada sob as restrições reais de memória do plano F1 do Azure App Service — o teste acima rodou localmente, sem esse limite.

@@ -22,10 +22,15 @@ def init_db() -> None:
             tamanho_mb REAL NOT NULL,
             status TEXT NOT NULL CHECK (status IN ('processando', 'concluido', 'erro')),
             texto_transcrito TEXT,
-            mensagem_erro TEXT
+            mensagem_erro TEXT,
+            progresso TEXT
         )
         """
     )
+    try:
+        conn.execute("ALTER TABLE transcricoes ADD COLUMN progresso TEXT")
+    except sqlite3.OperationalError:
+        pass  # coluna já existe (banco criado antes desta versão)
     conn.commit()
     conn.close()
 
@@ -50,7 +55,7 @@ def concluir_transcricao(id: int, texto_transcrito: str) -> None:
     conn.execute(
         """
         UPDATE transcricoes
-        SET status = 'concluido', texto_transcrito = ?, mensagem_erro = NULL
+        SET status = 'concluido', texto_transcrito = ?, mensagem_erro = NULL, progresso = NULL
         WHERE id = ?
         """,
         (texto_transcrito, id),
@@ -64,10 +69,20 @@ def marcar_erro(id: int, mensagem_erro: str) -> None:
     conn.execute(
         """
         UPDATE transcricoes
-        SET status = 'erro', mensagem_erro = ?
+        SET status = 'erro', mensagem_erro = ?, progresso = NULL
         WHERE id = ?
         """,
         (mensagem_erro, id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def atualizar_progresso(id: int, progresso: str) -> None:
+    conn = get_connection()
+    conn.execute(
+        "UPDATE transcricoes SET progresso = ? WHERE id = ?",
+        (progresso, id),
     )
     conn.commit()
     conn.close()

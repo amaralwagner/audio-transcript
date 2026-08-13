@@ -1,4 +1,4 @@
-const MAX_SIZE_MB = 25;
+const MAX_SIZE_MB = 200;
 const MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024;
 const POLL_INTERVAL_MS = 3000;
 
@@ -38,14 +38,17 @@ function formatarData(isoString) {
   return data.toLocaleString("pt-BR");
 }
 
-function statusHtml(status) {
-  if (status === "concluido") {
+function statusHtml(item) {
+  if (item.status === "concluido") {
     return '<span class="status concluido"><span class="icone">✔</span> Concluído</span>';
   }
-  if (status === "erro") {
+  if (item.status === "erro") {
     return '<span class="status erro"><span class="icone">✖</span> Erro</span>';
   }
-  return '<span class="status processando"><span class="spinner"></span> Processando</span>';
+  const detalhe = item.progresso
+    ? `<span class="status-detalhe">${escapeHtml(item.progresso)}</span>`
+    : "";
+  return `<span class="status processando"><span class="spinner"></span> Processando</span>${detalhe}`;
 }
 
 function renderLista(itens) {
@@ -62,7 +65,7 @@ function renderLista(itens) {
           <td>${escapeHtml(item.nome_arquivo)}</td>
           <td>${formatarData(item.data_envio)}</td>
           <td>${item.tamanho_mb} MB</td>
-          <td>${statusHtml(item.status)}</td>
+          <td>${statusHtml(item)}</td>
         </tr>
       `;
     })

@@ -111,6 +111,14 @@ body {
   color: #b8860b;
 }
 
+.status-detalhe {
+  display: block;
+  margin-top: 2px;
+  font-size: 0.78rem;
+  font-weight: 400;
+  color: #999;
+}
+
 .status.concluido {
   color: #2e7d32;
 }

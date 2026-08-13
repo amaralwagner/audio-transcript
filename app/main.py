@@ -1,6 +1,6 @@
+import math
 import os
 import shutil
-import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -10,6 +10,8 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from pydub import AudioSegment
+from pydub.exceptions import CouldntDecodeError
 
 import database
 
@@ -25,11 +27,27 @@ AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 
-MAX_SIZE_MB = 25
-MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024
+# Limite máximo aceito no upload — bem acima do limite do Whisper, só para
+# evitar abuso; arquivos entre WHISPER_LIMIT_MB e este valor são divididos
+# automaticamente antes de ir para a API.
+MAX_UPLOAD_MB = 200
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
-# O gpt-4o-transcribe rejeita áudios com mais de 1500s; cortamos com folga.
-CHUNK_SECONDS = 1200
+# Limite real do endpoint de transcrição do Whisper/Azure OpenAI.
+WHISPER_LIMIT_MB = 25
+WHISPER_LIMIT_BYTES = WHISPER_LIMIT_MB * 1024 * 1024
+
+# Tamanho-alvo de cada pedaço ao dividir um áudio grande — abaixo do limite
+# do Whisper com margem de segurança (a taxa de bits usada no re-encode dos
+# pedaços é fixa, então o tamanho de saída fica previsível).
+CHUNK_TARGET_MB = 20
+CHUNK_TARGET_BYTES = CHUNK_TARGET_MB * 1024 * 1024
+CHUNK_EXPORT_BITRATE = "128k"
+
+# ffmpeg empacotado pelo imageio-ffmpeg: evita depender de um ffmpeg
+# instalado no sistema (útil no Azure App Service Linux, onde o pacote
+# padrão nem sempre está disponível sem passo extra de apt/packages).
+AudioSegment.converter = imageio_ffmpeg.get_ffmpeg_exe()
 
 database.init_db()
 
@@ -41,24 +59,38 @@ def verificar_token(x_access_token: str = Header(default=None)):
         raise HTTPException(status_code=401, detail="Token de acesso inválido")
 
 
-def dividir_audio(caminho_arquivo: Path, pasta_saida: Path) -> list[Path]:
-    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    padrao_saida = pasta_saida / "parte_%03d.mp3"
-    comando = [
-        ffmpeg_exe,
-        "-y",
-        "-loglevel", "error",
-        "-i", str(caminho_arquivo),
-        "-vn",
-        "-map", "0:a:0",
-        "-f", "segment",
-        "-segment_time", str(CHUNK_SECONDS),
-        "-c", "copy",
-        "-reset_timestamps", "1",
-        str(padrao_saida),
-    ]
-    subprocess.run(comando, check=True, capture_output=True)
-    return sorted(pasta_saida.glob("parte_*.mp3"))
+def dividir_audio_por_tamanho(caminho_arquivo: Path, pasta_saida: Path) -> list[Path]:
+    """Divide um áudio em pedaços de tamanho aproximado, cortando por tempo.
+
+    O número de pedaços é calculado a partir do tamanho do arquivo original
+    (ex: 60MB / 20MB ~= 3 pedaços). A duração total é então dividida por esse
+    número de pedaços, e cada pedaço é decodificado e reexportado em uma taxa
+    de bits fixa (CHUNK_EXPORT_BITRATE) — isso corta em limites de amostra
+    real (não bytes arbitrários) e torna o tamanho de cada pedaço exportado
+    previsível independentemente da taxa de bits do arquivo original.
+    """
+    tamanho_bytes = caminho_arquivo.stat().st_size
+    num_partes = max(1, math.ceil(tamanho_bytes / CHUNK_TARGET_BYTES))
+
+    # format/codec explícitos evitam que o pydub tente rodar "ffprobe" para
+    # detectar o codec automaticamente — o imageio-ffmpeg só empacota o
+    # binário do ffmpeg, então "ffprobe" não está disponível no ambiente.
+    audio = AudioSegment.from_file(caminho_arquivo, format="mp3", codec="mp3")
+    duracao_total_ms = len(audio)
+    duracao_por_parte_ms = math.ceil(duracao_total_ms / num_partes)
+
+    caminhos = []
+    for indice in range(num_partes):
+        inicio_ms = indice * duracao_por_parte_ms
+        if inicio_ms >= duracao_total_ms:
+            break
+        fim_ms = min(inicio_ms + duracao_por_parte_ms, duracao_total_ms)
+        parte = audio[inicio_ms:fim_ms]
+        caminho_parte = pasta_saida / f"parte_{indice + 1:03d}.mp3"
+        parte.export(caminho_parte, format="mp3", bitrate=CHUNK_EXPORT_BITRATE)
+        caminhos.append(caminho_parte)
+
+    return caminhos
 
 
 def transcrever_chunk(caminho_chunk: Path) -> str:
@@ -84,18 +116,32 @@ def transcrever_arquivo(id: int, caminho_arquivo: Path) -> None:
         if not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_API_KEY or not AZURE_OPENAI_DEPLOYMENT:
             raise RuntimeError("Configuração do Azure OpenAI ausente no servidor")
 
-        pasta_partes.mkdir(exist_ok=True)
-        partes = dividir_audio(caminho_arquivo, pasta_partes)
-        if not partes:
-            raise RuntimeError("Não foi possível dividir o áudio para transcrição")
+        tamanho_bytes = caminho_arquivo.stat().st_size
 
-        textos = [transcrever_chunk(parte) for parte in partes]
-        texto = " ".join(t.strip() for t in textos if t.strip())
+        if tamanho_bytes <= WHISPER_LIMIT_BYTES:
+            texto = transcrever_chunk(caminho_arquivo)
+        else:
+            pasta_partes.mkdir(exist_ok=True)
+            partes = dividir_audio_por_tamanho(caminho_arquivo, pasta_partes)
+            if not partes:
+                raise RuntimeError("Não foi possível dividir o áudio para transcrição")
+
+            total_partes = len(partes)
+            textos = []
+            for indice, parte in enumerate(partes, start=1):
+                database.atualizar_progresso(id, f"Processando parte {indice} de {total_partes}")
+                try:
+                    textos.append(transcrever_chunk(parte))
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Falha ao transcrever parte {indice} de {total_partes}: {exc}"
+                    ) from exc
+
+            texto = " ".join(t.strip() for t in textos if t.strip())
 
         database.concluir_transcricao(id, texto)
-    except subprocess.CalledProcessError as exc:
-        erro_ffmpeg = exc.stderr.decode(errors="replace") if exc.stderr else str(exc)
-        database.marcar_erro(id, f"Falha ao processar o áudio (ffmpeg): {erro_ffmpeg}")
+    except CouldntDecodeError as exc:
+        database.marcar_erro(id, f"Falha ao processar o áudio (ffmpeg/pydub): {exc}")
     except Exception as exc:
         database.marcar_erro(id, str(exc))
     finally:
@@ -110,8 +156,8 @@ async def transcrever(background_tasks: BackgroundTasks, file: UploadFile = File
 
     conteudo = await file.read()
     tamanho_bytes = len(conteudo)
-    if tamanho_bytes > MAX_SIZE_BYTES:
-        raise HTTPException(status_code=400, detail=f"Arquivo excede o limite de {MAX_SIZE_MB}MB")
+    if tamanho_bytes > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail=f"Arquivo excede o limite máximo de {MAX_UPLOAD_MB}MB")
 
     tamanho_mb = round(tamanho_bytes / (1024 * 1024), 2)
     data_envio = datetime.now().isoformat(timespec="seconds")
