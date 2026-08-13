@@ -1,6 +1,8 @@
 import math
 import os
+import re
 import shutil
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -33,15 +35,21 @@ AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 MAX_UPLOAD_MB = 200
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
-# Limite real do endpoint de transcrição do Whisper/Azure OpenAI.
+# Limite real do endpoint de transcrição do Whisper/Azure OpenAI. Dois
+# limites independentes: tamanho do arquivo E duração — um áudio pode ser
+# pequeno em bytes (taxa de bits baixa) e ainda assim durar mais que
+# WHISPER_MAX_DURATION_SECONDS (visto na prática: 22,58MB / 52,8min).
 WHISPER_LIMIT_MB = 25
 WHISPER_LIMIT_BYTES = WHISPER_LIMIT_MB * 1024 * 1024
+WHISPER_MAX_DURATION_SECONDS = 1500
 
-# Tamanho-alvo de cada pedaço ao dividir um áudio grande — abaixo do limite
-# do Whisper com margem de segurança (a taxa de bits usada no re-encode dos
-# pedaços é fixa, então o tamanho de saída fica previsível).
+# Alvos de cada pedaço ao dividir um áudio grande — abaixo dos limites do
+# Whisper com margem de segurança (a taxa de bits usada no re-encode dos
+# pedaços é fixa, então o tamanho de saída fica previsível). O número de
+# pedaços usado é o maior entre o exigido pelo tamanho e pela duração.
 CHUNK_TARGET_MB = 20
 CHUNK_TARGET_BYTES = CHUNK_TARGET_MB * 1024 * 1024
+CHUNK_TARGET_DURATION_SECONDS = 1200
 CHUNK_EXPORT_BITRATE = "128k"
 
 # ffmpeg empacotado pelo imageio-ffmpeg: evita depender de um ffmpeg
@@ -59,19 +67,35 @@ def verificar_token(x_access_token: str = Header(default=None)):
         raise HTTPException(status_code=401, detail="Token de acesso inválido")
 
 
-def dividir_audio_por_tamanho(caminho_arquivo: Path, pasta_saida: Path) -> list[Path]:
-    """Divide um áudio em pedaços de tamanho aproximado, cortando por tempo.
+def obter_duracao_segundos(caminho_arquivo: Path) -> float:
+    """Lê a duração do áudio a partir do cabeçalho reportado pelo ffmpeg.
 
-    O número de pedaços é calculado a partir do tamanho do arquivo original
-    (ex: 60MB / 20MB ~= 3 pedaços). A duração total é então dividida por esse
-    número de pedaços, e cada pedaço é decodificado e reexportado em uma taxa
-    de bits fixa (CHUNK_EXPORT_BITRATE) — isso corta em limites de amostra
-    real (não bytes arbitrários) e torna o tamanho de cada pedaço exportado
+    Roda "ffmpeg -i arquivo" sem definir uma saída: o ffmpeg lê os metadados
+    do arquivo, imprime a duração no stderr e sai com erro (nenhuma saída foi
+    pedida) — mas não precisamos do código de saída, só do texto. É bem mais
+    barato que decodificar o áudio inteiro (que só é feito depois, e apenas
+    se a divisão for realmente necessária).
+    """
+    resultado = subprocess.run(
+        [imageio_ffmpeg.get_ffmpeg_exe(), "-i", str(caminho_arquivo)],
+        capture_output=True,
+        text=True,
+    )
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.\d+)", resultado.stderr)
+    if not match:
+        raise RuntimeError("Não foi possível determinar a duração do áudio")
+    horas, minutos, segundos = match.groups()
+    return int(horas) * 3600 + int(minutos) * 60 + float(segundos)
+
+
+def dividir_audio_por_tamanho(caminho_arquivo: Path, pasta_saida: Path, num_partes: int) -> list[Path]:
+    """Divide um áudio em `num_partes` pedaços de duração igual.
+
+    Cada pedaço é decodificado e reexportado em uma taxa de bits fixa
+    (CHUNK_EXPORT_BITRATE) — isso corta em limites de amostra real (não
+    bytes arbitrários) e torna o tamanho de cada pedaço exportado
     previsível independentemente da taxa de bits do arquivo original.
     """
-    tamanho_bytes = caminho_arquivo.stat().st_size
-    num_partes = max(1, math.ceil(tamanho_bytes / CHUNK_TARGET_BYTES))
-
     # format/codec explícitos evitam que o pydub tente rodar "ffprobe" para
     # detectar o codec automaticamente — o imageio-ffmpeg só empacota o
     # binário do ffmpeg, então "ffprobe" não está disponível no ambiente.
@@ -117,12 +141,21 @@ def transcrever_arquivo(id: int, caminho_arquivo: Path) -> None:
             raise RuntimeError("Configuração do Azure OpenAI ausente no servidor")
 
         tamanho_bytes = caminho_arquivo.stat().st_size
+        duracao_segundos = obter_duracao_segundos(caminho_arquivo)
 
-        if tamanho_bytes <= WHISPER_LIMIT_BYTES:
+        precisa_dividir = (
+            tamanho_bytes > WHISPER_LIMIT_BYTES or duracao_segundos > WHISPER_MAX_DURATION_SECONDS
+        )
+
+        if not precisa_dividir:
             texto = transcrever_chunk(caminho_arquivo)
         else:
+            partes_por_tamanho = math.ceil(tamanho_bytes / CHUNK_TARGET_BYTES)
+            partes_por_duracao = math.ceil(duracao_segundos / CHUNK_TARGET_DURATION_SECONDS)
+            num_partes = max(1, partes_por_tamanho, partes_por_duracao)
+
             pasta_partes.mkdir(exist_ok=True)
-            partes = dividir_audio_por_tamanho(caminho_arquivo, pasta_partes)
+            partes = dividir_audio_por_tamanho(caminho_arquivo, pasta_partes, num_partes)
             if not partes:
                 raise RuntimeError("Não foi possível dividir o áudio para transcrição")
 

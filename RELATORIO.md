@@ -271,3 +271,24 @@ Resultado, contra o recurso Azure real (`wdo-mkhacjbb-eastus2`, deployment `gpt-
 ### Limitação conhecida não testada
 
 A decodificação do áudio inteiro em memória pelo `pydub` antes da divisão (ver seção 9) não foi testada sob as restrições reais de memória do plano F1 do Azure App Service — o teste acima rodou localmente, sem esse limite.
+
+### Bug encontrado em produção logo após o primeiro deploy: divisão só considerava tamanho, não duração
+
+Depois do primeiro deploy desta mudança, o usuário testou com uma gravação real (`Gravação de Tela 2026-08-13 155646.mp3`, 22,58MB) e recebeu erro nas duas tentativas:
+
+```
+Erro do Azure (400): {"error": {"message": "audio duration 3169.32... seconds is longer
+than 1500 seconds which is the maximum for this model", "type": "invalid_request_error", ...}}
+```
+
+**Causa:** a decisão de dividir ou não o áudio (seção acima) considerava só `WHISPER_LIMIT_BYTES` (25MB). O arquivo do usuário tinha 22,58MB — abaixo do limite de tamanho — mas 3169s (~52,8min) de duração, bem acima do limite separado de **1500 segundos** que o `gpt-4o-transcribe` também impõe (uma gravação de voz em taxa de bits baixa pode ser pequena em MB e ainda assim durar muito). A implementação da seção anterior nunca cogitava esse caso porque só testava tamanho. Essa checagem por duração já existia no código *antes* desta leva de mudanças (constante `CHUNK_SECONDS = 1200`, sempre aplicada), e foi perdida na reescrita — reintroduzida agora, desta vez combinada com a divisão por tamanho.
+
+**Correção** (`app/main.py`):
+- Nova constante `WHISPER_MAX_DURATION_SECONDS = 1500` e `CHUNK_TARGET_DURATION_SECONDS = 1200` (mesma margem de segurança do código antigo).
+- Nova função `obter_duracao_segundos()`: roda `ffmpeg -i arquivo` (sem definir saída) e lê a duração da linha `Duration:` no `stderr` — não decodifica o áudio inteiro, só lê o cabeçalho, então é barato de chamar sempre (diferente de abrir com `pydub`, que decodifica tudo).
+- `transcrever_arquivo()` agora decide dividir se **tamanho > 25MB OU duração > 1500s** (antes só considerava tamanho).
+- Quando divide, o número de pedaços passa a ser `max(pedaços_por_tamanho, pedaços_por_duração)` — `dividir_audio_por_tamanho()` passou a receber esse número já calculado em vez de calculá-lo sozinho a partir só do tamanho.
+
+**Validado localmente** reproduzindo o cenário exato: um `.mp3` sintético de 11,88MB com 25min57s de duração (taxa de bits baixa, 64kbps) — mesma combinação "pequeno em MB, longo em duração" do arquivo real que falhou. Resultado: dividido corretamente em 2 partes (decisão pela duração, já que por tamanho sozinho não precisaria dividir), progresso e conclusão corretos, texto das duas partes concatenado na ordem certa, arquivos temporários limpos.
+
+Reimplantado no App Service (`transcricao-audio-wagner`) logo em seguida.
